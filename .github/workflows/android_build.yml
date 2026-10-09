@@ -8,7 +8,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
 
     steps:
-      - name: 原生强制纯静态编译 Retis
+      - name: 强制纯静态构建 Retis
         run: |
           cat << 'EOF' > run_build.sh
           #!/bin/sh
@@ -27,15 +27,24 @@ jobs:
           git clone --depth 1 https://github.com/retis-org/retis.git /retis
           cd /retis
 
-          # 【核心修复】：注入 -C link-arg=-static，强制整包纯静态链接
-          TARGET=$(rustc -vV | sed -n 's|host: ||p')
-          TARGET_UPPER=$(echo "$TARGET" | tr '[:lower:]-' '[:upper:]_')
-          export CARGO_TARGET_${TARGET_UPPER}_RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-static"
-          export LIBPCAP_STATIC=true
+          # 【终极手段 1】：物理删除系统中的 .so 动态共享库，强迫链接器只能读取 .a 静态归档
+          rm -f /usr/lib/libpcap.so* /usr/lib/libelf.so* /usr/lib/libz.so*
 
-          # 编译
+          # 【终极手段 2】：在 Cargo 根目录直接注入最高优先级的 config.toml 配置
+          mkdir -p .cargo
+          cat << 'CARGO_EOF' > .cargo/config.toml
+          [build]
+          rustflags = [
+              "-C", "target-feature=+crt-static",
+              "-C", "link-arg=-static",
+              "-C", "link-arg=-no-pie"
+          ]
+          CARGO_EOF
+
+          # 执行编译
           CARGO_CMD_OPTS="--no-default-features" make release
 
+          # 提取、脱壳并导出
           BIN_PATH=$(find target/release -name retis -type f -perm -111 | head -n 1)
           strip "$BIN_PATH"
           cp "$BIN_PATH" /output/retis
@@ -44,10 +53,12 @@ jobs:
           chmod +x run_build.sh
           docker run --rm -v ${{ github.workspace }}:/output alpine:edge /output/run_build.sh
 
-      - name: 验证是否为纯静态 (看输出必须包含 statically linked)
+      - name: 验证二进制属性 (必须为 statically linked)
         run: |
           ls -lh retis
           file retis
+          # 如果依然不是纯静态，直接在 CI 中阻断报错，防止下载无效文件
+          file retis | grep -q "statically linked" || (echo "错误：产物仍然不是纯静态！" && exit 1)
 
       - name: 上传构建产物 (Artifact)
         uses: actions/upload-artifact@v4
