@@ -8,19 +8,20 @@ jobs:
     runs-on: ubuntu-24.04-arm
 
     steps:
-      - name: 编译 Retis 纯静态单一二进制
+      - name: 编译 Retis 真正的单二进制 (Pure Static)
         run: |
           cat << 'EOF' > run_build.sh
           #!/bin/sh
           set -eux
 
           apk update
-          # 安装编译链及所有必要的静态依赖库
+          # 安装编译链及所有静态依赖库（包含 libnl、zstd、bzip2 的静态版本）
           apk add git rust cargo clang llvm llvm-dev clang-dev elfutils-dev \
                   musl-dev linux-headers make pkgconfig zlib-dev zlib-static \
-                  zstd-static bzip2-static libpcap-dev jq coreutils binutils
+                  zstd-static bzip2-static libpcap-dev jq coreutils binutils \
+                  libnl3-dev libnl3-static
 
-          # 自动修正 LLVM 工具链路径
+          # 修正 LLVM 工具链路径
           LLVM_BIN=$(find /usr/lib/llvm*/bin -name llvm-objcopy 2>/dev/null | head -n 1)
           if [ -n "$LLVM_BIN" ]; then
               export PATH="$(dirname $LLVM_BIN):$PATH"
@@ -31,8 +32,11 @@ jobs:
 
           TARGET=$(rustc -vV | sed -n 's|host: ||p')
 
-          # 核心配置：同时传入 +crt-static、-static 和 -no-pie
-          # 彻底消除 Static-PIE 导致的动态解释器嵌入
+          # 【核心 1】：强制所有 C 依赖库（libpcap/libelf）在 pkg-config 阶段就必须使用静态归档
+          export PKG_CONFIG_ALL_STATIC=1
+          export LIBPCAP_STATIC=true
+
+          # 【核心 2】：注入 Rust 原生关闭 PIE 的 relocation-model 以及静态链接参数
           mkdir -p .cargo
           cat << CARGO_EOF > .cargo/config.toml
           [build]
@@ -41,15 +45,16 @@ jobs:
           [target.${TARGET}]
           rustflags = [
               "-C", "target-feature=+crt-static",
+              "-C", "relocation-model=static",
               "-C", "link-arg=-static",
               "-C", "link-arg=-no-pie"
           ]
           CARGO_EOF
 
-          # 编译 release 版本（跳过外部 python 依赖）
+          # 编译 release 产物
           CARGO_CMD_OPTS="--no-default-features" make release
 
-          # 自动提取产物并剔除多余调试符号
+          # 提取单一二进制并剥离调试符号
           BIN_PATH=$(find target/${TARGET}/release target/release -name retis -type f -perm -111 2>/dev/null | head -n 1)
           strip "$BIN_PATH"
           cp "$BIN_PATH" /output/retis
@@ -58,11 +63,11 @@ jobs:
           chmod +x run_build.sh
           docker run --rm -v ${{ github.workspace }}:/output alpine:edge /output/run_build.sh
 
-      - name: 验证二进制属性 (严格检查 statically linked)
+      - name: 验证二进制属性 (必须为纯静态)
         run: |
           ls -lh retis
           file retis
-          # 核心门禁：一旦出现 dynamically linked 或 interpreter 直接报错阻断
+          # 门禁断言：必须是真正的静态可执行文件，绝不允许出现 interpreter
           file retis | grep -q "statically linked"
 
       - name: 上传单一二进制文件 (Artifact)
