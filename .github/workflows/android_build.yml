@@ -5,11 +5,10 @@ on:
 
 jobs:
   build:
-    # 核心升级：直接使用 GitHub 官方原生的 4核 ARM64 物理服务器！
     runs-on: ubuntu-24.04-arm
 
     steps:
-      - name: 原生编译 Retis 纯静态 Android 二进制
+      - name: 原生强制纯静态编译 Retis
         run: |
           cat << 'EOF' > run_build.sh
           #!/bin/sh
@@ -20,35 +19,32 @@ jobs:
                   musl-dev linux-headers make pkgconfig zlib-dev zlib-static \
                   libpcap-dev jq coreutils binutils
 
-          # 自动修正 LLVM 工具链路径
           LLVM_BIN=$(find /usr/lib/llvm*/bin -name llvm-objcopy 2>/dev/null | head -n 1)
           if [ -n "$LLVM_BIN" ]; then
               export PATH="$(dirname $LLVM_BIN):$PATH"
           fi
 
-          # 拉取源码
           git clone --depth 1 https://github.com/retis-org/retis.git /retis
           cd /retis
 
-          # 注入纯静态链接参数
+          # 【核心修复】：注入 -C link-arg=-static，强制整包纯静态链接
           TARGET=$(rustc -vV | sed -n 's|host: ||p')
           TARGET_UPPER=$(echo "$TARGET" | tr '[:lower:]-' '[:upper:]_')
-          export CARGO_TARGET_${TARGET_UPPER}_RUSTFLAGS="-C target-feature=+crt-static"
+          export CARGO_TARGET_${TARGET_UPPER}_RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-static"
+          export LIBPCAP_STATIC=true
 
-          # 原生 4 核全速编译（关闭 python 外部依赖）
+          # 编译
           CARGO_CMD_OPTS="--no-default-features" make release
 
-          # 导出并剥离符号
           BIN_PATH=$(find target/release -name retis -type f -perm -111 | head -n 1)
           strip "$BIN_PATH"
           cp "$BIN_PATH" /output/retis
           EOF
 
           chmod +x run_build.sh
-          # 原生 ARM64 容器运行，无需任何跨架构模拟器
           docker run --rm -v ${{ github.workspace }}:/output alpine:edge /output/run_build.sh
 
-      - name: 验证二进制属性
+      - name: 验证是否为纯静态 (看输出必须包含 statically linked)
         run: |
           ls -lh retis
           file retis
