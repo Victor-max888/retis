@@ -1,37 +1,52 @@
 name: Build Retis for Android ARM64
 
 on:
-  workflow_dispatch: # 支持网页上手动点击按钮触发构建
+  workflow_dispatch: # 支持手动点击按钮触发构建
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Set up QEMU (跨架构模拟器)
-        uses: docker/setup-qemu-action@v3
+    # 锁定稳定的 Ubuntu 24.04 运行器，消除系统迁移提示
+    runs-on: ubuntu-24.04
 
-      - name: 启动 Alpine ARM64 容器静态编译
+    steps:
+      - name: 启用 ARM64 跨架构支持 (直调容器，消除 Node.js 插件警告)
         run: |
-          docker run --rm --platform linux/arm64 -v ${{ github.workspace }}:/output alpine:edge sh -euxc "
-            apk update
-            # 安装构建工具链与静态库依赖
-            apk add git rust cargo clang llvm-dev clang-dev elfutils-dev \
-                    musl-dev linux-headers make pkgconfig zlib-dev zlib-static \
-                    libpcap-dev libpcap-static jq
-            
-            # 克隆 retis 最新源码
-            git clone --depth 1 https://github.com/retis-org/retis.git /retis
-            cd /retis
-            
-            # 开启纯静态链接
-            # 优先关闭 python 插件依赖（Android 内部没有 libpython，独立运行必须去除）
-            export RUSTFLAGS='-C target-feature=+crt-static'
-            cargo build --release --no-default-features || cargo build --release
-            
-            # 压缩剥离调试符号
-            strip target/release/retis
-            cp target/release/retis /output/retis
-          "
+          docker run --privileged --rm tonistiigi/binfmt --install arm64
+
+      - name: 纯静态编译 Retis (Alpine ARM64)
+        run: |
+          # 1. 编写容器内部执行脚本（避免复杂的引号转义）
+          cat << 'EOF' > run_build.sh
+          #!/bin/sh
+          set -eux
+
+          apk update
+          # 安装编译工具链（已移除不存在的 libpcap-static，保留 libpcap-dev 即可）
+          apk add git rust cargo clang llvm-dev clang-dev elfutils-dev \
+                  musl-dev linux-headers make pkgconfig zlib-dev zlib-static \
+                  libpcap-dev jq coreutils
+
+          # 拉取 retis 源码
+          git clone --depth 1 https://github.com/retis-org/retis.git /retis
+          cd /retis
+
+          # 注入纯静态链接参数，并关闭 Android 不支持的 python 插件
+          export RUSTFLAGS="-C target-feature=+crt-static"
+          export CARGO_CMD_OPTS="--no-default-features"
+
+          # 优先调用官方针对无依赖编译的 release 目标
+          make release || cargo build --release --no-default-features
+
+          # 自动定位编译生成的 retis 二进制文件并剥离调试符号
+          BIN_PATH=$(find target -name retis -type f -perm -111 | head -n 1)
+          strip "$BIN_PATH"
+          cp "$BIN_PATH" /output/retis
+          EOF
+
+          chmod +x run_build.sh
+
+          # 2. 挂载并在 Alpine ARM64 容器内执行编译
+          docker run --rm --platform linux/arm64 -v ${{ github.workspace }}:/output alpine:edge /output/run_build.sh
 
       - name: 验证二进制属性
         run: |
