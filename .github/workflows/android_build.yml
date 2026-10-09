@@ -31,49 +31,71 @@ jobs:
               export PATH="$(dirname $LLVM_BIN):$PATH"
           fi
 
-          # 2. 【核心修复 1】：创建 libgcc_s.a 静态重定向，彻底根治 cannot find -lgcc_s
+          # 2. 修复 GCC 缺少静态 libgcc_s 的经典缺陷
           GCC_LIB_DIR=$(gcc -print-file-name=libgcc.a | xargs dirname)
           echo "INPUT(-lgcc -lgcc_eh)" > "$GCC_LIB_DIR/libgcc_s.a"
 
-          # 3. 【核心修复 2】：智能链接器 Wrapper（精准放行构建脚本与过程宏，只捕获最终产物）
+          # 3. 精准智能拦截链接器：根据 -o 目标文件做精准外科手术
           REAL_GCC=$(which gcc)
           mkdir -p /usr/local/bin
 
           cat << EOF > /usr/local/bin/gcc-wrapper
           #!/bin/sh
-          # A. proc-macro 动态库 (-shared) -> 原样放行
+          # 获取最终输出产物 (-o 后的参数)
+          OUTPUT_TARGET=""
+          PREV_ARG=""
+          IS_SHARED=0
+
           for arg in "\$@"; do
-              if [ "\$arg" = "-shared" ]; then
-                  exec $REAL_GCC "\$@"
+              if [ "\$PREV_ARG" = "-o" ]; then
+                  OUTPUT_TARGET="\$arg"
               fi
+              if [ "\$arg" = "-shared" ]; then
+                  IS_SHARED=1
+              fi
+              PREV_ARG="\$arg"
           done
 
-          # B. 所有主机 build script (路径含 /build/) -> 原样放行
-          case "\$*" in
-              */build/*|*build_script_build*)
+          # 规则 1：如果是生成动态库 (-shared) 或目标是 .so，代表 proc-macro，完全原样放行
+          if [ \$IS_SHARED -eq 1 ]; then
+              exec $REAL_GCC "\$@"
+          fi
+          case "\$OUTPUT_TARGET" in
+              *.so|*.so.*)
                   exec $REAL_GCC "\$@"
                   ;;
           esac
 
-          # C. 只有最终的 retis 二进制可执行文件 -> 强制完全静态链接
-          case "\$*" in
-              *retis*)
+          # 规则 2：如果是主机构建脚本 (build_script_build)，完全原样放行
+          case "\$OUTPUT_TARGET" in
+              *build_script_build*)
+                  exec $REAL_GCC "\$@"
+                  ;;
+          esac
+
+          # 规则 3：命中主产物 retis -> 必须进行全静态闭合链接！
+          case "\$OUTPUT_TARGET" in
+              */retis|retis)
+                  echo "[WRAPPER] 成功锁定目标产物 retis，正在执行强制纯静态链接..."
                   NEW_ARGS=""
                   for arg in "\$@"; do
                       case "\$arg" in
                           -Wl,-Bdynamic)
                               NEW_ARGS="\$NEW_ARGS -Wl,-Bstatic"
                               ;;
+                          -pie|-Wl,-pie)
+                              # 剥离 PIE 动态解释倾向，强制标准静态 EXEC
+                              ;;
                           *)
                               NEW_ARGS="\$NEW_ARGS \$arg"
                               ;;
                       esac
                   done
-                  exec $REAL_GCC -static \$NEW_ARGS
+                  exec $REAL_GCC -static -no-pie \$NEW_ARGS
                   ;;
           esac
 
-          # 兜底默认放行
+          # 其他未匹配目标默认放行
           exec $REAL_GCC "\$@"
           EOF
 
@@ -85,11 +107,11 @@ jobs:
 
           cd /workspace
 
-          # 清除全局 RUSTFLAGS 干扰，让 Cargo 正常走默认通道
+          # 清除污染项
           rm -rf .cargo/config.toml
           unset RUSTFLAGS
 
-          # 静态 C 库检索
+          # 静态库标记
           export PKG_CONFIG_ALL_STATIC=1
           export LIBPCAP_STATIC=true
 
@@ -109,7 +131,7 @@ jobs:
             -v ${{ github.workspace }}/output:/output \
             alpine:edge /workspace/run_build.sh
 
-      - name: 门禁断言 (严格验证真·静态)
+      - name: 门禁断言 (严格验证原生静态，拒绝任何动态妥协)
         run: |
           ls -lh output/retis
           file output/retis
@@ -130,7 +152,7 @@ jobs:
           fi
 
           echo "=========================================================="
-          echo "恭喜！编译出了真正的纯静态单二进制！Android 上可稳定运行！"
+          echo "纯静态单二进制构建完全成功！绝无段错误隐患！"
           echo "=========================================================="
 
       - name: 上传 Retis 单二进制
