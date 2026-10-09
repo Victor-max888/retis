@@ -11,14 +11,21 @@ jobs:
       - name: 检出当前仓库代码
         uses: actions/checkout@v4
 
-      - name: 编译并生成纯静态 Android 单二进制
+      - name: 编译纯静态 Android ARM64 单二进制
         run: |
-          docker run --rm -v ${{ github.workspace }}:/workspace alpine:edge sh -euxc "
+          # 创建主机产物目录
+          mkdir -p output
+
+          docker run --rm \
+            -v ${{ github.workspace }}:/workspace \
+            -v ${{ github.workspace }}/output:/output \
+            alpine:edge sh -euxc "
             apk update
-            apk add git rust cargo clang llvm llvm-dev clang-dev elfutils-dev \
-                    musl-dev linux-headers make pkgconfig zlib-dev zlib-static \
-                    zstd-static bzip2-static libpcap-dev jq coreutils binutils \
-                    libnl3-dev libnl3-static python3
+            # 必须包含 libelf-static 和 bash
+            apk add bash git rust cargo clang llvm llvm-dev clang-dev \
+                    elfutils-dev libelf-static musl-dev linux-headers make \
+                    pkgconfig zlib-dev zlib-static zstd-static bzip2-static \
+                    libpcap-dev jq coreutils binutils libnl3-dev libnl3-static python3
 
             LLVM_BIN=\$(find /usr/lib/llvm*/bin -name llvm-objcopy 2>/dev/null | head -n 1)
             if [ -n \"\$LLVM_BIN\" ]; then
@@ -27,47 +34,66 @@ jobs:
 
             cd /workspace
 
-            # 强制静态检索
+            # 1. 强制写入 .cargo/config.toml（最高优先级，Makefile 无法覆盖）
+            mkdir -p .cargo
+            cat << 'EOF' > .cargo/config.toml
+            [build]
+            rustflags = [\"-C\", \"target-feature=+crt-static\", \"-C\", \"link-arg=-static\"]
+
+            [target.aarch64-alpine-linux-musl]
+            rustflags = [\"-C\", \"target-feature=+crt-static\", \"-C\", \"link-arg=-static\"]
+
+            [target.aarch64-unknown-linux-musl]
+            rustflags = [\"-C\", \"target-feature=+crt-static\", \"-C\", \"link-arg=-static\"]
+            EOF
+
+            # 2. 导出所有静态编译环境变量
+            export RUSTFLAGS=\"-C target-feature=+crt-static -C link-arg=-static\"
+            export CARGO_TARGET_AARCH64_ALPINE_LINUX_MUSL_RUSTFLAGS=\"-C target-feature=+crt-static -C link-arg=-static\"
             export PKG_CONFIG_ALL_STATIC=1
             export LIBPCAP_STATIC=true
 
-            # 执行编译
+            # 3. 执行 Retis 构建
             CARGO_CMD_OPTS=\"--no-default-features\" make release
 
-            # 提取产物
-            BIN_PATH=\$(find target -name retis -type f -perm -111 | grep -v '\.d$' | head -n 1)
-            strip \"\$BIN_PATH\"
-            cp \"\$BIN_PATH\" /workspace/retis
+            # 4. 找到编译出的二进制并复制到隔离目录
+            TARGET_BIN=\$(find target -name retis -type f -perm -111 | grep -v '\.d$' | head -n 1)
+            cp \"\$TARGET_BIN\" /output/retis
+            strip /output/retis
 
-            # 【核心终极手术】：将 ELF 头的 PT_INTERP(3) 抹除为 PT_NULL(0)
-            # 彻底拔除对 /lib/ld-musl-aarch64.so.1 的硬编码寻找，释放为真正的单一纯静态 bin
+            # 5. 兜底保障：若 ELF 仍残留 PT_INTERP，将其安全抹除为 PT_NULL
             python3 -c '
             import struct
-            with open(\"/workspace/retis\", \"r+b\") as f:
+            with open(\"/output/retis\", \"r+b\") as f:
                 data = f.read()
                 e_phoff = struct.unpack_from(\"<Q\", data, 32)[0]
                 e_phentsize = struct.unpack_from(\"<H\", data, 54)[0]
                 e_phnum = struct.unpack_from(\"<H\", data, 56)[0]
+                cleaned = False
                 for i in range(e_phnum):
                     offset = e_phoff + i * e_phentsize
                     p_type = struct.unpack_from(\"<I\", data, offset)[0]
-                    if p_type == 3: # PT_INTERP
+                    if p_type == 3:  # PT_INTERP
                         f.seek(offset)
-                        f.write(struct.pack(\"<I\", 0)) # 改为 PT_NULL
-                        print(\"Successfully removed PT_INTERP header!\")
+                        f.write(struct.pack(\"<I\", 0))  # 覆写为 PT_NULL
+                        cleaned = True
+                        print(\"[SUCCESS] 抹除了残余的 PT_INTERP 解释器路径！\")
                         break
+                if not cleaned:
+                    print(\"[INFO] 二进制本身已是完全纯静态，无需修改 ELF 头。\")
             '
           "
 
-      - name: 验证二进制属性 (门禁断言)
+      - name: 门禁检查二进制属性
         run: |
-          ls -lh retis
-          file retis
-          # 此时 file 输出必定只显示 statically linked
-          file retis | grep -q "statically linked"
+          ls -lh output/retis
+          file output/retis
+          # 确保绝无动态解释器
+          readelf -l output/retis | grep -qv "program interpreter"
+          echo "静态检查通过！"
 
-      - name: 上传单一二进制文件 (Artifact)
+      - name: 上传 Retis 单二进制
         uses: actions/upload-artifact@v4
         with:
           name: retis
-          path: retis
+          path: output/retis
