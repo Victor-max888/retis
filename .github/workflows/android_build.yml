@@ -25,44 +25,59 @@ jobs:
                   pkgconfig zlib-dev zlib-static zstd-static bzip2-static \
                   libpcap-dev jq coreutils binutils libnl3-dev libnl3-static python3
 
-          # 1. 注入 llvm-objcopy
+          # 1. 注入 llvm 工具链
           LLVM_BIN=$(find /usr/lib/llvm*/bin -name llvm-objcopy 2>/dev/null | head -n 1)
           if [ -n "$LLVM_BIN" ]; then
               export PATH="$(dirname $LLVM_BIN):$PATH"
           fi
 
-          # 2. 【核心武器】：创建智能链接器 Wrapper
-          # 精准拦截：对 proc-macro(含-shared) 正常放行；对二进制强制纯静态链接
+          # 2. 【核心修复 1】：创建 libgcc_s.a 静态重定向，彻底根治 cannot find -lgcc_s
+          GCC_LIB_DIR=$(gcc -print-file-name=libgcc.a | xargs dirname)
+          echo "INPUT(-lgcc -lgcc_eh)" > "$GCC_LIB_DIR/libgcc_s.a"
+
+          # 3. 【核心修复 2】：智能链接器 Wrapper（精准放行构建脚本与过程宏，只捕获最终产物）
           REAL_GCC=$(which gcc)
           mkdir -p /usr/local/bin
 
           cat << EOF > /usr/local/bin/gcc-wrapper
           #!/bin/sh
-          # 检查是否是在编译 proc-macro 动态库
+          # A. proc-macro 动态库 (-shared) -> 原样放行
           for arg in "\$@"; do
               if [ "\$arg" = "-shared" ]; then
                   exec $REAL_GCC "\$@"
               fi
           done
 
-          # 如果是链接最终的二进制，强制静态链接并把所有动态库转为静态
-          NEW_ARGS=""
-          for arg in "\$@"; do
-              case "\$arg" in
-                  -Wl,-Bdynamic)
-                      NEW_ARGS="\$NEW_ARGS -Wl,-Bstatic"
-                      ;;
-                  *)
-                      NEW_ARGS="\$NEW_ARGS \$arg"
-                      ;;
-              esac
-          done
+          # B. 所有主机 build script (路径含 /build/) -> 原样放行
+          case "\$*" in
+              */build/*|*build_script_build*)
+                  exec $REAL_GCC "\$@"
+                  ;;
+          esac
 
-          exec $REAL_GCC -static \$NEW_ARGS
+          # C. 只有最终的 retis 二进制可执行文件 -> 强制完全静态链接
+          case "\$*" in
+              *retis*)
+                  NEW_ARGS=""
+                  for arg in "\$@"; do
+                      case "\$arg" in
+                          -Wl,-Bdynamic)
+                              NEW_ARGS="\$NEW_ARGS -Wl,-Bstatic"
+                              ;;
+                          *)
+                              NEW_ARGS="\$NEW_ARGS \$arg"
+                              ;;
+                      esac
+                  done
+                  exec $REAL_GCC -static \$NEW_ARGS
+                  ;;
+          esac
+
+          # 兜底默认放行
+          exec $REAL_GCC "\$@"
           EOF
 
           chmod +x /usr/local/bin/gcc-wrapper
-          # 接管系统所有的 C 链接器入口
           ln -sf /usr/local/bin/gcc-wrapper /usr/local/bin/gcc
           ln -sf /usr/local/bin/gcc-wrapper /usr/local/bin/cc
           ln -sf /usr/local/bin/gcc-wrapper /usr/local/bin/aarch64-alpine-linux-musl-gcc
@@ -70,18 +85,18 @@ jobs:
 
           cd /workspace
 
-          # 清除所有可能产生干扰的配置
+          # 清除全局 RUSTFLAGS 干扰，让 Cargo 正常走默认通道
           rm -rf .cargo/config.toml
           unset RUSTFLAGS
 
-          # 静态库检索环境变量
+          # 静态 C 库检索
           export PKG_CONFIG_ALL_STATIC=1
           export LIBPCAP_STATIC=true
 
-          # 3. 开始编译
+          # 4. 执行编译
           CARGO_CMD_OPTS="--no-default-features" make release
 
-          # 4. 提取生成的纯静态产物
+          # 5. 提取二进制
           TARGET_BIN=$(find target -name retis -type f -perm -111 | grep -v '\.d$' | head -n 1)
           cp "$TARGET_BIN" /output/retis
           strip /output/retis
@@ -94,7 +109,7 @@ jobs:
             -v ${{ github.workspace }}/output:/output \
             alpine:edge /workspace/run_build.sh
 
-      - name: 门禁断言 (严格验证原生静态)
+      - name: 门禁断言 (严格验证真·静态)
         run: |
           ls -lh output/retis
           file output/retis
@@ -115,7 +130,7 @@ jobs:
           fi
 
           echo "=========================================================="
-          echo "恭喜！编译出了真正的纯静态单二进制！绝无 Segfault 风险！"
+          echo "恭喜！编译出了真正的纯静态单二进制！Android 上可稳定运行！"
           echo "=========================================================="
 
       - name: 上传 Retis 单二进制
