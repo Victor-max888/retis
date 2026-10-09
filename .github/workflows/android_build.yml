@@ -8,7 +8,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
 
     steps:
-      - name: 强制纯静态构建 Retis
+      - name: 纯静态编译 Retis (无解释器依赖)
         run: |
           cat << 'EOF' > run_build.sh
           #!/bin/sh
@@ -27,24 +27,30 @@ jobs:
           git clone --depth 1 https://github.com/retis-org/retis.git /retis
           cd /retis
 
-          # 【终极手段 1】：物理删除系统中的 .so 动态共享库，强迫链接器只能读取 .a 静态归档
-          rm -f /usr/lib/libpcap.so* /usr/lib/libelf.so* /usr/lib/libz.so*
+          # 创建专用的纯静态库隔离目录，不破坏容器自身的系统动态库
+          mkdir -p /static-libs
+          cp /usr/lib/libpcap.a /static-libs/
+          cp /usr/lib/libelf.a /static-libs/
+          cp /usr/lib/libz.a /static-libs/
 
-          # 【终极手段 2】：在 Cargo 根目录直接注入最高优先级的 config.toml 配置
+          # 配置 Cargo 专项目标链接参数：
+          # 1. target-feature=+crt-static：静态 libc
+          # 2. link-arg=-static：强制静态链接
+          # 3. 优先检索 /static-libs
           mkdir -p .cargo
           cat << 'CARGO_EOF' > .cargo/config.toml
-          [build]
+          [target.aarch64-alpine-linux-musl]
           rustflags = [
               "-C", "target-feature=+crt-static",
               "-C", "link-arg=-static",
-              "-C", "link-arg=-no-pie"
+              "-L", "native=/static-libs"
           ]
           CARGO_EOF
 
           # 执行编译
           CARGO_CMD_OPTS="--no-default-features" make release
 
-          # 提取、脱壳并导出
+          # 提取并剥离调试信息
           BIN_PATH=$(find target/release -name retis -type f -perm -111 | head -n 1)
           strip "$BIN_PATH"
           cp "$BIN_PATH" /output/retis
@@ -53,12 +59,12 @@ jobs:
           chmod +x run_build.sh
           docker run --rm -v ${{ github.workspace }}:/output alpine:edge /output/run_build.sh
 
-      - name: 验证二进制属性 (必须为 statically linked)
+      - name: 验证二进制属性 (严格校验静态属性)
         run: |
           ls -lh retis
           file retis
-          # 如果依然不是纯静态，直接在 CI 中阻断报错，防止下载无效文件
-          file retis | grep -q "statically linked" || (echo "错误：产物仍然不是纯静态！" && exit 1)
+          # 确保必须是 statically linked，杜绝动态解释器
+          file retis | grep -q "statically linked"
 
       - name: 上传构建产物 (Artifact)
         uses: actions/upload-artifact@v4
