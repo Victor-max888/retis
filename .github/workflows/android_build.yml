@@ -20,11 +20,12 @@ jobs:
           set -eux
 
           apk update
-          # 安装全部开发库及静态库（补齐 xz-dev 确保 liblzma.a 齐全）
+          # 安装全部 C 依赖的开发与静态包（重点补全 xz-static，提供 liblzma.a）
           apk add bash git rust cargo clang llvm llvm-dev clang-dev \
                   elfutils-dev libelf-static musl-dev linux-headers make \
                   pkgconfig zlib-dev zlib-static zstd-static bzip2-static \
-                  xz-dev libpcap-dev jq coreutils binutils libnl3-dev libnl3-static python3
+                  xz-dev xz-static libpcap-dev jq coreutils binutils \
+                  libnl3-dev libnl3-static python3
 
           # 1. 注入 llvm-objcopy
           LLVM_BIN=$(find /usr/lib/llvm*/bin -name llvm-objcopy 2>/dev/null | head -n 1)
@@ -32,11 +33,11 @@ jobs:
               export PATH="$(dirname $LLVM_BIN):$PATH"
           fi
 
-          # 2. 修复 musl 静态链接时缺失 -lgcc_s 的问题
+          # 2. 修复 musl 静态链接时缺失 -lgcc_s 的底层硬伤
           GCC_LIB_DIR=$(gcc -print-file-name=libgcc.a | xargs dirname)
           echo "INPUT(-lgcc -lgcc_eh)" > "$GCC_LIB_DIR/libgcc_s.a"
 
-          # 3. 拦截器：放行过程宏与构建工具，捕获 retis 并补全 libelf 间接静态库
+          # 3. 智能链接器 Wrapper
           REAL_GCC=$(which gcc)
           mkdir -p /usr/local/bin
 
@@ -73,7 +74,7 @@ jobs:
                   ;;
           esac
 
-          # C. 命中 retis 二进制 -> 注入 -static 并补全静态传递依赖 (-lzstd -lbz2 -llzma)
+          # C. 命中 retis 二进制 -> 注入 -static 并闭包解析全部底层静态库
           case "\$OUTPUT_TARGET" in
               *retis*)
                   echo ">>> [LINKER WRAPPER HIT] 拦截到 retis 二进制: \$OUTPUT_TARGET，补全静态依赖并执行全静态链接... <<<"
@@ -84,14 +85,14 @@ jobs:
                               NEW_ARGS="\$NEW_ARGS -Wl,-Bstatic"
                               ;;
                           -pie|-Wl,-pie)
-                              # 剥离 PIE 动态特征
+                              # 剥离 PIE 动态特征，强制纯静态 EXEC
                               ;;
                           *)
                               NEW_ARGS="\$NEW_ARGS \$arg"
                               ;;
                       esac
                   done
-                  # 核心补全：在末尾追加静态库闭包循环解析，彻底解决 ZSTD_... 符号缺失
+                  # 循环闭包解析 libelf 及其依赖的所有压缩静态库 (zstd, bz2, zlib, lzma)
                   exec $REAL_GCC -static -no-pie \$NEW_ARGS -Wl,--start-group -lelf -lzstd -lbz2 -lz -llzma -Wl,--end-group
                   ;;
           esac
@@ -107,7 +108,7 @@ jobs:
 
           cd /workspace
 
-          # 强制 Cargo 指定此包装器作为 target 链接器
+          # 强制 Cargo 指定包装器
           mkdir -p .cargo
           cat << 'EOF_CARGO' > .cargo/config.toml
           [target.aarch64-alpine-linux-musl]
@@ -154,7 +155,7 @@ jobs:
           fi
 
           echo "=========================================================="
-          echo "纯静态单二进制构建大功告成！推送到 Android 即可直接运行！"
+          echo "纯静态单二进制构建完全成功！推送到 Android 即可直接运行！"
           echo "=========================================================="
 
       - name: 上传 Retis 单二进制
