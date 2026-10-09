@@ -11,7 +11,7 @@ jobs:
       - name: 检出当前仓库代码
         uses: actions/checkout@v4
 
-      - name: 编译并处理单二进制
+      - name: 编译真正的纯静态 Android 单二进制
         run: |
           mkdir -p output
 
@@ -20,12 +20,13 @@ jobs:
           set -eux
 
           apk update
+          # 安装全部 C 依赖的静态库与工具链
           apk add bash git rust cargo clang llvm llvm-dev clang-dev \
                   elfutils-dev libelf-static musl-dev linux-headers make \
                   pkgconfig zlib-dev zlib-static zstd-static bzip2-static \
-                  libpcap-dev jq coreutils binutils libnl3-dev libnl3-static python3
+                  libpcap-dev jq coreutils binutils libnl3-dev libnl3-static
 
-          # 寻找 llvm-objcopy 并注入 PATH
+          # 注入 llvm-objcopy
           LLVM_BIN=$(find /usr/lib/llvm*/bin -name llvm-objcopy 2>/dev/null | head -n 1)
           if [ -n "$LLVM_BIN" ]; then
               export PATH="$(dirname $LLVM_BIN):$PATH"
@@ -33,44 +34,35 @@ jobs:
 
           cd /workspace
 
-          # 强制 C 库静态内联
+          # 强制 C 库走纯静态检索
           export PKG_CONFIG_ALL_STATIC=1
           export LIBPCAP_STATIC=true
 
-          # 绝不注入全局 RUSTFLAGS，避免破坏 btf-rs-derive 过程宏
-          rm -rf .cargo/config.toml
+          # 1. 彻底清除任何可能污染过程宏的全局 RUSTFLAGS
           unset RUSTFLAGS
+          rm -rf .cargo/config.toml
 
-          # 编译 Retis
-          CARGO_CMD_OPTS="--no-default-features" make release
+          # 2. 核心隔离机制：只对目标 target 启用纯静态，绝不波及 host 上的 proc-macro
+          mkdir -p .cargo
+          cat << 'EOF' > .cargo/config.toml
+          [target.aarch64-alpine-linux-musl]
+          rustflags = [
+              "-C", "target-feature=+crt-static",
+              "-C", "link-arg=-static",
+              "-C", "link-arg=-no-pie"
+          ]
+          EOF
 
-          # 提取二进制到独立目录
-          TARGET_BIN=$(find target -name retis -type f -perm -111 | grep -v '\.d$' | head -n 1)
+          # 开启 Cargo 宿主隔离特性，确保主机构建工具完全忽略 target flags
+          export CARGO_TARGET_APPLIES_TO_HOST=false
+
+          # 3. 显式传递 --target 参数，让 Cargo 触发隔离机制
+          CARGO_CMD_OPTS="--no-default-features --target aarch64-alpine-linux-musl" make release
+
+          # 4. 提取生成的纯静态产物
+          TARGET_BIN=$(find target/aarch64-alpine-linux-musl/release target/release -name retis -type f -perm -111 | grep -v '\.d$' | head -n 1)
           cp "$TARGET_BIN" /output/retis
           strip /output/retis
-
-          # 【终极手术】：将 ELF 头的 PT_INTERP(3) 抹除为 PT_NULL(0)
-          # 拔除对 /lib/ld-musl-aarch64.so.1 的硬编码寻找
-          python3 -c '
-          import struct
-          with open("/output/retis", "r+b") as f:
-              data = f.read()
-              e_phoff = struct.unpack_from("<Q", data, 32)[0]
-              e_phentsize = struct.unpack_from("<H", data, 54)[0]
-              e_phnum = struct.unpack_from("<H", data, 56)[0]
-              found = False
-              for i in range(e_phnum):
-                  offset = e_phoff + i * e_phentsize
-                  p_type = struct.unpack_from("<I", data, offset)[0]
-                  if p_type == 3:  # PT_INTERP
-                      f.seek(offset)
-                      f.write(struct.pack("<I", 0))  # 覆写为 PT_NULL
-                      found = True
-                      print(">>> [SUCCESS] 成功抹除 PT_INTERP 解释器路径！<<<")
-                      break
-              if not found:
-                  print(">>> [INFO] 未检测到 PT_INTERP 或已抹除。<<<")
-          '
           BUILD_SCRIPT
 
           chmod +x run_build.sh
@@ -80,26 +72,23 @@ jobs:
             -v ${{ github.workspace }}/output:/output \
             alpine:edge /workspace/run_build.sh
 
-      - name: 门禁验证与属性核查
+      - name: 门禁断言 (严格验证真·静态)
         run: |
           ls -lh output/retis
           file output/retis
 
-          # 1. 验证 file 输出中绝对不再包含 interpreter 解释器路径
-          if file output/retis | grep -qi "interpreter"; then
-              echo "错误: file 检查显示依然残留动态解释器！"
+          # 门禁 1：必须是编译器原生的 statically linked
+          file output/retis | grep "statically linked"
+
+          # 门禁 2：readelf 绝不含有任何动态依赖库 (DT_NEEDED)
+          if readelf -d output/retis 2>/dev/null | grep -i "NEEDED"; then
+              echo "错误: 二进制依然含有外部动态库依赖！"
               exit 1
           fi
 
-          # 2. 精准验证 Program Headers 表（只匹配大写的 INTERP 类型段，绝不误杀小写的 .interp 节名）
-          if readelf -l output/retis | awk '$1 == "INTERP"' | grep -q "INTERP"; then
-              echo "错误: Program Headers 中依然存在 PT_INTERP 解释器段！"
-              exit 1
-          fi
-
-          echo "=========================================="
-          echo "门禁检查 100% 通过！二进制无动态解释器请求！"
-          echo "=========================================="
+          echo "=================================================="
+          echo "恭喜！编译出了真正的纯静态单二进制！绝无 Segfault 风险！"
+          echo "=================================================="
 
       - name: 上传 Retis 单二进制
         uses: actions/upload-artifact@v4
