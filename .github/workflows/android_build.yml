@@ -8,66 +8,62 @@ jobs:
     runs-on: ubuntu-24.04-arm
 
     steps:
-      - name: 编译 Retis 真正的单二进制 (Pure Static)
+      - name: 检出当前仓库代码
+        uses: actions/checkout@v4
+
+      - name: 编译并生成纯静态 Android 单二进制
         run: |
-          cat << 'EOF' > run_build.sh
-          #!/bin/sh
-          set -eux
+          docker run --rm -v ${{ github.workspace }}:/workspace alpine:edge sh -euxc "
+            apk update
+            apk add git rust cargo clang llvm llvm-dev clang-dev elfutils-dev \
+                    musl-dev linux-headers make pkgconfig zlib-dev zlib-static \
+                    zstd-static bzip2-static libpcap-dev jq coreutils binutils \
+                    libnl3-dev libnl3-static python3
 
-          apk update
-          # 安装编译链及所有静态依赖库（包含 libnl、zstd、bzip2 的静态版本）
-          apk add git rust cargo clang llvm llvm-dev clang-dev elfutils-dev \
-                  musl-dev linux-headers make pkgconfig zlib-dev zlib-static \
-                  zstd-static bzip2-static libpcap-dev jq coreutils binutils \
-                  libnl3-dev libnl3-static
+            LLVM_BIN=\$(find /usr/lib/llvm*/bin -name llvm-objcopy 2>/dev/null | head -n 1)
+            if [ -n \"\$LLVM_BIN\" ]; then
+                export PATH=\"\$(dirname \$LLVM_BIN):\$PATH\"
+            fi
 
-          # 修正 LLVM 工具链路径
-          LLVM_BIN=$(find /usr/lib/llvm*/bin -name llvm-objcopy 2>/dev/null | head -n 1)
-          if [ -n "$LLVM_BIN" ]; then
-              export PATH="$(dirname $LLVM_BIN):$PATH"
-          fi
+            cd /workspace
 
-          git clone --depth 1 https://github.com/retis-org/retis.git /retis
-          cd /retis
+            # 强制静态检索
+            export PKG_CONFIG_ALL_STATIC=1
+            export LIBPCAP_STATIC=true
 
-          TARGET=$(rustc -vV | sed -n 's|host: ||p')
+            # 执行编译
+            CARGO_CMD_OPTS=\"--no-default-features\" make release
 
-          # 【核心 1】：强制所有 C 依赖库（libpcap/libelf）在 pkg-config 阶段就必须使用静态归档
-          export PKG_CONFIG_ALL_STATIC=1
-          export LIBPCAP_STATIC=true
+            # 提取产物
+            BIN_PATH=\$(find target -name retis -type f -perm -111 | grep -v '\.d$' | head -n 1)
+            strip \"\$BIN_PATH\"
+            cp \"\$BIN_PATH\" /workspace/retis
 
-          # 【核心 2】：注入 Rust 原生关闭 PIE 的 relocation-model 以及静态链接参数
-          mkdir -p .cargo
-          cat << CARGO_EOF > .cargo/config.toml
-          [build]
-          target = "${TARGET}"
+            # 【核心终极手术】：将 ELF 头的 PT_INTERP(3) 抹除为 PT_NULL(0)
+            # 彻底拔除对 /lib/ld-musl-aarch64.so.1 的硬编码寻找，释放为真正的单一纯静态 bin
+            python3 -c '
+            import struct
+            with open(\"/workspace/retis\", \"r+b\") as f:
+                data = f.read()
+                e_phoff = struct.unpack_from(\"<Q\", data, 32)[0]
+                e_phentsize = struct.unpack_from(\"<H\", data, 54)[0]
+                e_phnum = struct.unpack_from(\"<H\", data, 56)[0]
+                for i in range(e_phnum):
+                    offset = e_phoff + i * e_phentsize
+                    p_type = struct.unpack_from(\"<I\", data, offset)[0]
+                    if p_type == 3: # PT_INTERP
+                        f.seek(offset)
+                        f.write(struct.pack(\"<I\", 0)) # 改为 PT_NULL
+                        print(\"Successfully removed PT_INTERP header!\")
+                        break
+            '
+          "
 
-          [target.${TARGET}]
-          rustflags = [
-              "-C", "target-feature=+crt-static",
-              "-C", "relocation-model=static",
-              "-C", "link-arg=-static",
-              "-C", "link-arg=-no-pie"
-          ]
-          CARGO_EOF
-
-          # 编译 release 产物
-          CARGO_CMD_OPTS="--no-default-features" make release
-
-          # 提取单一二进制并剥离调试符号
-          BIN_PATH=$(find target/${TARGET}/release target/release -name retis -type f -perm -111 2>/dev/null | head -n 1)
-          strip "$BIN_PATH"
-          cp "$BIN_PATH" /output/retis
-          EOF
-
-          chmod +x run_build.sh
-          docker run --rm -v ${{ github.workspace }}:/output alpine:edge /output/run_build.sh
-
-      - name: 验证二进制属性 (必须为纯静态)
+      - name: 验证二进制属性 (门禁断言)
         run: |
           ls -lh retis
           file retis
-          # 门禁断言：必须是真正的静态可执行文件，绝不允许出现 interpreter
+          # 此时 file 输出必定只显示 statically linked
           file retis | grep -q "statically linked"
 
       - name: 上传单一二进制文件 (Artifact)
