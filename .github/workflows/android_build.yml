@@ -20,10 +20,11 @@ jobs:
           set -eux
 
           apk update
+          # 安装全部开发库及静态库（补齐 xz-dev 确保 liblzma.a 齐全）
           apk add bash git rust cargo clang llvm llvm-dev clang-dev \
                   elfutils-dev libelf-static musl-dev linux-headers make \
                   pkgconfig zlib-dev zlib-static zstd-static bzip2-static \
-                  libpcap-dev jq coreutils binutils libnl3-dev libnl3-static python3
+                  xz-dev libpcap-dev jq coreutils binutils libnl3-dev libnl3-static python3
 
           # 1. 注入 llvm-objcopy
           LLVM_BIN=$(find /usr/lib/llvm*/bin -name llvm-objcopy 2>/dev/null | head -n 1)
@@ -31,11 +32,11 @@ jobs:
               export PATH="$(dirname $LLVM_BIN):$PATH"
           fi
 
-          # 2. 修复 musl 静态链接时缺失 -lgcc_s 的底层硬伤
+          # 2. 修复 musl 静态链接时缺失 -lgcc_s 的问题
           GCC_LIB_DIR=$(gcc -print-file-name=libgcc.a | xargs dirname)
           echo "INPUT(-lgcc -lgcc_eh)" > "$GCC_LIB_DIR/libgcc_s.a"
 
-          # 3. 编写核心拦截器
+          # 3. 拦截器：放行过程宏与构建工具，捕获 retis 并补全 libelf 间接静态库
           REAL_GCC=$(which gcc)
           mkdir -p /usr/local/bin
 
@@ -55,7 +56,7 @@ jobs:
               PREV_ARG="\$arg"
           done
 
-          # A. 遇到 proc-macro 动态库 (-shared 或 .so) -> 100% 原生放行
+          # A. proc-macro 动态库 (-shared 或 .so) -> 100% 原生放行
           if [ \$IS_SHARED -eq 1 ]; then
               exec $REAL_GCC "\$@"
           fi
@@ -65,17 +66,17 @@ jobs:
                   ;;
           esac
 
-          # B. 遇到主机构建脚本 (build_script_build) -> 100% 原生放行
+          # B. 主机构建脚本 (build_script_build) -> 100% 原生放行
           case "\$OUTPUT_TARGET" in
               *build_script_build*)
                   exec $REAL_GCC "\$@"
                   ;;
           esac
 
-          # C. 精准捕获 Cargo 输出的目标 retis (包括 target/.../deps/retis-<hash>)
+          # C. 命中 retis 二进制 -> 注入 -static 并补全静态传递依赖 (-lzstd -lbz2 -llzma)
           case "\$OUTPUT_TARGET" in
               *retis*)
-                  echo ">>> [LINKER WRAPPER HIT] 拦截到 retis 二进制: \$OUTPUT_TARGET，正在注入纯静态参数！ <<<"
+                  echo ">>> [LINKER WRAPPER HIT] 拦截到 retis 二进制: \$OUTPUT_TARGET，补全静态依赖并执行全静态链接... <<<"
                   NEW_ARGS=""
                   for arg in "\$@"; do
                       case "\$arg" in
@@ -83,18 +84,18 @@ jobs:
                               NEW_ARGS="\$NEW_ARGS -Wl,-Bstatic"
                               ;;
                           -pie|-Wl,-pie)
-                              # 剥离 PIE 动态特征，强制静态 EXEC
+                              # 剥离 PIE 动态特征
                               ;;
                           *)
                               NEW_ARGS="\$NEW_ARGS \$arg"
                               ;;
                       esac
                   done
-                  exec $REAL_GCC -static -no-pie \$NEW_ARGS
+                  # 核心补全：在末尾追加静态库闭包循环解析，彻底解决 ZSTD_... 符号缺失
+                  exec $REAL_GCC -static -no-pie \$NEW_ARGS -Wl,--start-group -lelf -lzstd -lbz2 -lz -llzma -Wl,--end-group
                   ;;
           esac
 
-          # 默认兜底放行
           exec $REAL_GCC "\$@"
           EOF
 
@@ -106,21 +107,20 @@ jobs:
 
           cd /workspace
 
-          # 4. 强制 Cargo 指定此包装器作为 target 链接器（最高优先级，绝无遗漏可能）
+          # 强制 Cargo 指定此包装器作为 target 链接器
           mkdir -p .cargo
           cat << 'EOF_CARGO' > .cargo/config.toml
           [target.aarch64-alpine-linux-musl]
           linker = "/usr/local/bin/gcc-wrapper"
           EOF_CARGO
 
-          # 静态库标记
           export PKG_CONFIG_ALL_STATIC=1
           export LIBPCAP_STATIC=true
 
-          # 5. 执行 Retis 构建
+          # 4. 执行 Retis 构建
           CARGO_CMD_OPTS="--no-default-features" make release
 
-          # 6. 提取纯静态产物
+          # 5. 提取纯静态产物
           TARGET_BIN=$(find target -name retis -type f -perm -111 | grep -v '\.d$' | head -n 1)
           cp "$TARGET_BIN" /output/retis
           strip /output/retis
