@@ -1,51 +1,57 @@
 name: Build Retis for Android ARM64
 
 on:
-  workflow_dispatch: # 支持手动点击按钮触发构建
+  workflow_dispatch:
 
 jobs:
   build:
-    # 锁定稳定的 Ubuntu 24.04 运行器，消除系统迁移提示
     runs-on: ubuntu-24.04
 
     steps:
-      - name: 启用 ARM64 跨架构支持 (直调容器，消除 Node.js 插件警告)
+      - name: 启用 ARM64 跨架构支持
         run: |
           docker run --privileged --rm tonistiigi/binfmt --install arm64
 
-      - name: 纯静态编译 Retis (Alpine ARM64)
+      - name: 编译 Retis 纯静态 Android 二进制
         run: |
-          # 1. 编写容器内部执行脚本（避免复杂的引号转义）
           cat << 'EOF' > run_build.sh
           #!/bin/sh
           set -eux
 
           apk update
-          # 安装编译工具链（已移除不存在的 libpcap-static，保留 libpcap-dev 即可）
-          apk add git rust cargo clang llvm-dev clang-dev elfutils-dev \
+          # 补充 llvm 完整工具集，确保 llvm-objcopy 就绪
+          apk add git rust cargo clang llvm llvm-dev clang-dev elfutils-dev \
                   musl-dev linux-headers make pkgconfig zlib-dev zlib-static \
-                  libpcap-dev jq coreutils
+                  libpcap-dev jq coreutils binutils
 
-          # 拉取 retis 源码
+          # 1. 修复 llvm-objcopy 路径（将 Alpine 的 LLVM 工具路径加入 PATH）
+          LLVM_BIN=$(find /usr/lib/llvm*/bin -name llvm-objcopy 2>/dev/null | head -n 1)
+          if [ -n "$LLVM_BIN" ]; then
+              export PATH="$(dirname $LLVM_BIN):$PATH"
+          fi
+          # 验证 llvm-objcopy 存在
+          which llvm-objcopy
+
+          # 2. 拉取 retis 源码
           git clone --depth 1 https://github.com/retis-org/retis.git /retis
           cd /retis
 
-          # 注入纯静态链接参数，并关闭 Android 不支持的 python 插件
-          export RUSTFLAGS="-C target-feature=+crt-static"
-          export CARGO_CMD_OPTS="--no-default-features"
+          # 3. 修复 proc-macro 静态编译冲突：
+          # 绝对不能全局 export RUSTFLAGS，必须通过 Cargo Target 单独指定，保护 proc-macro
+          TARGET=$(rustc -vV | sed -n 's|host: ||p')
+          TARGET_UPPER=$(echo "$TARGET" | tr '[:lower:]-' '[:upper:]_')
+          export CARGO_TARGET_${TARGET_UPPER}_RUSTFLAGS="-C target-feature=+crt-static"
 
-          # 优先调用官方针对无依赖编译的 release 目标
-          make release || cargo build --release --no-default-features
+          # 4. 编译（关闭外部 python 运行时依赖）
+          CARGO_CMD_OPTS="--no-default-features" make release
 
-          # 自动定位编译生成的 retis 二进制文件并剥离调试符号
-          BIN_PATH=$(find target -name retis -type f -perm -111 | head -n 1)
+          # 5. 定位产物、剥离符号并导出
+          BIN_PATH=$(find target/release -name retis -type f -perm -111 | head -n 1)
           strip "$BIN_PATH"
           cp "$BIN_PATH" /output/retis
           EOF
 
           chmod +x run_build.sh
-
-          # 2. 挂载并在 Alpine ARM64 容器内执行编译
           docker run --rm --platform linux/arm64 -v ${{ github.workspace }}:/output alpine:edge /output/run_build.sh
 
       - name: 验证二进制属性
