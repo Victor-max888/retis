@@ -20,47 +20,69 @@ jobs:
           set -eux
 
           apk update
-          # 安装全部 C 依赖的静态库与工具链
           apk add bash git rust cargo clang llvm llvm-dev clang-dev \
                   elfutils-dev libelf-static musl-dev linux-headers make \
                   pkgconfig zlib-dev zlib-static zstd-static bzip2-static \
-                  libpcap-dev jq coreutils binutils libnl3-dev libnl3-static
+                  libpcap-dev jq coreutils binutils libnl3-dev libnl3-static python3
 
-          # 注入 llvm-objcopy
+          # 1. 注入 llvm-objcopy
           LLVM_BIN=$(find /usr/lib/llvm*/bin -name llvm-objcopy 2>/dev/null | head -n 1)
           if [ -n "$LLVM_BIN" ]; then
               export PATH="$(dirname $LLVM_BIN):$PATH"
           fi
 
+          # 2. 【核心武器】：创建智能链接器 Wrapper
+          # 精准拦截：对 proc-macro(含-shared) 正常放行；对二进制强制纯静态链接
+          REAL_GCC=$(which gcc)
+          mkdir -p /usr/local/bin
+
+          cat << EOF > /usr/local/bin/gcc-wrapper
+          #!/bin/sh
+          # 检查是否是在编译 proc-macro 动态库
+          for arg in "\$@"; do
+              if [ "\$arg" = "-shared" ]; then
+                  exec $REAL_GCC "\$@"
+              fi
+          done
+
+          # 如果是链接最终的二进制，强制静态链接并把所有动态库转为静态
+          NEW_ARGS=""
+          for arg in "\$@"; do
+              case "\$arg" in
+                  -Wl,-Bdynamic)
+                      NEW_ARGS="\$NEW_ARGS -Wl,-Bstatic"
+                      ;;
+                  *)
+                      NEW_ARGS="\$NEW_ARGS \$arg"
+                      ;;
+              esac
+          done
+
+          exec $REAL_GCC -static \$NEW_ARGS
+          EOF
+
+          chmod +x /usr/local/bin/gcc-wrapper
+          # 接管系统所有的 C 链接器入口
+          ln -sf /usr/local/bin/gcc-wrapper /usr/local/bin/gcc
+          ln -sf /usr/local/bin/gcc-wrapper /usr/local/bin/cc
+          ln -sf /usr/local/bin/gcc-wrapper /usr/local/bin/aarch64-alpine-linux-musl-gcc
+          export PATH="/usr/local/bin:$PATH"
+
           cd /workspace
 
-          # 强制 C 库走纯静态检索
+          # 清除所有可能产生干扰的配置
+          rm -rf .cargo/config.toml
+          unset RUSTFLAGS
+
+          # 静态库检索环境变量
           export PKG_CONFIG_ALL_STATIC=1
           export LIBPCAP_STATIC=true
 
-          # 1. 彻底清除任何可能污染过程宏的全局 RUSTFLAGS
-          unset RUSTFLAGS
-          rm -rf .cargo/config.toml
-
-          # 2. 核心隔离机制：只对目标 target 启用纯静态，绝不波及 host 上的 proc-macro
-          mkdir -p .cargo
-          cat << 'EOF' > .cargo/config.toml
-          [target.aarch64-alpine-linux-musl]
-          rustflags = [
-              "-C", "target-feature=+crt-static",
-              "-C", "link-arg=-static",
-              "-C", "link-arg=-no-pie"
-          ]
-          EOF
-
-          # 开启 Cargo 宿主隔离特性，确保主机构建工具完全忽略 target flags
-          export CARGO_TARGET_APPLIES_TO_HOST=false
-
-          # 3. 显式传递 --target 参数，让 Cargo 触发隔离机制
-          CARGO_CMD_OPTS="--no-default-features --target aarch64-alpine-linux-musl" make release
+          # 3. 开始编译
+          CARGO_CMD_OPTS="--no-default-features" make release
 
           # 4. 提取生成的纯静态产物
-          TARGET_BIN=$(find target/aarch64-alpine-linux-musl/release target/release -name retis -type f -perm -111 | grep -v '\.d$' | head -n 1)
+          TARGET_BIN=$(find target -name retis -type f -perm -111 | grep -v '\.d$' | head -n 1)
           cp "$TARGET_BIN" /output/retis
           strip /output/retis
           BUILD_SCRIPT
@@ -72,23 +94,29 @@ jobs:
             -v ${{ github.workspace }}/output:/output \
             alpine:edge /workspace/run_build.sh
 
-      - name: 门禁断言 (严格验证真·静态)
+      - name: 门禁断言 (严格验证原生静态)
         run: |
           ls -lh output/retis
           file output/retis
 
-          # 门禁 1：必须是编译器原生的 statically linked
+          # 1. 验证必须是原生的 statically linked
           file output/retis | grep "statically linked"
 
-          # 门禁 2：readelf 绝不含有任何动态依赖库 (DT_NEEDED)
+          # 2. 验证绝无动态解释器
+          if file output/retis | grep -i "interpreter"; then
+              echo "错误: 依然残留动态解释器！"
+              exit 1
+          fi
+
+          # 3. 验证绝无外部动态库依赖 (DT_NEEDED)
           if readelf -d output/retis 2>/dev/null | grep -i "NEEDED"; then
               echo "错误: 二进制依然含有外部动态库依赖！"
               exit 1
           fi
 
-          echo "=================================================="
+          echo "=========================================================="
           echo "恭喜！编译出了真正的纯静态单二进制！绝无 Segfault 风险！"
-          echo "=================================================="
+          echo "=========================================================="
 
       - name: 上传 Retis 单二进制
         uses: actions/upload-artifact@v4
