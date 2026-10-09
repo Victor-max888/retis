@@ -5,54 +5,48 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    # 核心升级：直接使用 GitHub 官方原生的 4核 ARM64 物理服务器！
+    runs-on: ubuntu-24.04-arm
 
     steps:
-      - name: 启用 ARM64 跨架构支持
-        run: |
-          docker run --privileged --rm tonistiigi/binfmt --install arm64
-
-      - name: 编译 Retis 纯静态 Android 二进制
+      - name: 原生编译 Retis 纯静态 Android 二进制
         run: |
           cat << 'EOF' > run_build.sh
           #!/bin/sh
           set -eux
 
           apk update
-          # 补充 llvm 完整工具集，确保 llvm-objcopy 就绪
           apk add git rust cargo clang llvm llvm-dev clang-dev elfutils-dev \
                   musl-dev linux-headers make pkgconfig zlib-dev zlib-static \
                   libpcap-dev jq coreutils binutils
 
-          # 1. 修复 llvm-objcopy 路径（将 Alpine 的 LLVM 工具路径加入 PATH）
+          # 自动修正 LLVM 工具链路径
           LLVM_BIN=$(find /usr/lib/llvm*/bin -name llvm-objcopy 2>/dev/null | head -n 1)
           if [ -n "$LLVM_BIN" ]; then
               export PATH="$(dirname $LLVM_BIN):$PATH"
           fi
-          # 验证 llvm-objcopy 存在
-          which llvm-objcopy
 
-          # 2. 拉取 retis 源码
+          # 拉取源码
           git clone --depth 1 https://github.com/retis-org/retis.git /retis
           cd /retis
 
-          # 3. 修复 proc-macro 静态编译冲突：
-          # 绝对不能全局 export RUSTFLAGS，必须通过 Cargo Target 单独指定，保护 proc-macro
+          # 注入纯静态链接参数
           TARGET=$(rustc -vV | sed -n 's|host: ||p')
           TARGET_UPPER=$(echo "$TARGET" | tr '[:lower:]-' '[:upper:]_')
           export CARGO_TARGET_${TARGET_UPPER}_RUSTFLAGS="-C target-feature=+crt-static"
 
-          # 4. 编译（关闭外部 python 运行时依赖）
+          # 原生 4 核全速编译（关闭 python 外部依赖）
           CARGO_CMD_OPTS="--no-default-features" make release
 
-          # 5. 定位产物、剥离符号并导出
+          # 导出并剥离符号
           BIN_PATH=$(find target/release -name retis -type f -perm -111 | head -n 1)
           strip "$BIN_PATH"
           cp "$BIN_PATH" /output/retis
           EOF
 
           chmod +x run_build.sh
-          docker run --rm --platform linux/arm64 -v ${{ github.workspace }}:/output alpine:edge /output/run_build.sh
+          # 原生 ARM64 容器运行，无需任何跨架构模拟器
+          docker run --rm -v ${{ github.workspace }}:/output alpine:edge /output/run_build.sh
 
       - name: 验证二进制属性
         run: |
