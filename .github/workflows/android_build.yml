@@ -11,89 +11,97 @@ jobs:
       - name: 检出当前仓库代码
         uses: actions/checkout@v4
 
-      - name: 编译纯静态 Android ARM64 单二进制
+      - name: 准备构建脚本并执行编译
         run: |
-          # 创建主机产物目录
           mkdir -p output
 
+          # 生成纯净的容器内执行脚本，避免 YAML 多层引号和 heredoc 缩进陷阱
+          cat << 'BUILD_SCRIPT' > run_build.sh
+          #!/bin/sh
+          set -eux
+
+          apk update
+          # 安装全部底层库和 libelf 静态库、bash
+          apk add bash git rust cargo clang llvm llvm-dev clang-dev \
+                  elfutils-dev libelf-static musl-dev linux-headers make \
+                  pkgconfig zlib-dev zlib-static zstd-static bzip2-static \
+                  libpcap-dev jq coreutils binutils libnl3-dev libnl3-static python3
+
+          # 寻找 llvm-objcopy 并注入 PATH
+          LLVM_BIN=$(find /usr/lib/llvm*/bin -name llvm-objcopy 2>/dev/null | head -n 1)
+          if [ -n "$LLVM_BIN" ]; then
+              export PATH="$(dirname $LLVM_BIN):$PATH"
+          fi
+
+          cd /workspace
+
+          # 强制底层静态链接 (写入 .cargo/config.toml)
+          mkdir -p .cargo
+          printf '[build]\nrustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=-static"]\n\n[target.aarch64-alpine-linux-musl]\nrustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=-static"]\n' > .cargo/config.toml
+
+          export RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-static"
+          export CARGO_TARGET_AARCH64_ALPINE_LINUX_MUSL_RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-static"
+          export PKG_CONFIG_ALL_STATIC=1
+          export LIBPCAP_STATIC=true
+
+          # 开始编译
+          CARGO_CMD_OPTS="--no-default-features" make release
+
+          # 提取二进制
+          TARGET_BIN=$(find target -name retis -type f -perm -111 | grep -v '\.d$' | head -n 1)
+          if [ -z "$TARGET_BIN" ]; then
+              echo "错误: 未找到生成的 retis 二进制！"
+              exit 1
+          fi
+
+          cp "$TARGET_BIN" /output/retis
+          strip /output/retis
+
+          # 检查并清除残留的动态解释器（若有）
+          python3 -c '
+          import struct
+          with open("/output/retis", "r+b") as f:
+              data = f.read()
+              e_phoff = struct.unpack_from("<Q", data, 32)[0]
+              e_phentsize = struct.unpack_from("<H", data, 54)[0]
+              e_phnum = struct.unpack_from("<H", data, 56)[0]
+              for i in range(e_phnum):
+                  offset = e_phoff + i * e_phentsize
+                  p_type = struct.unpack_from("<I", data, offset)[0]
+                  if p_type == 3:  # PT_INTERP
+                      f.seek(offset)
+                      f.write(struct.pack("<I", 0))  # 抹去解释器依赖
+                      print("[SUCCESS] 抹除了残余的 PT_INTERP 解释器路径！")
+                      break
+          '
+          BUILD_SCRIPT
+
+          chmod +x run_build.sh
+
+          # 挂载并启动 Alpine 进行原生编译
           docker run --rm \
             -v ${{ github.workspace }}:/workspace \
             -v ${{ github.workspace }}/output:/output \
-            alpine:edge sh -euxc "
-            apk update
-            # 必须包含 libelf-static 和 bash
-            apk add bash git rust cargo clang llvm llvm-dev clang-dev \
-                    elfutils-dev libelf-static musl-dev linux-headers make \
-                    pkgconfig zlib-dev zlib-static zstd-static bzip2-static \
-                    libpcap-dev jq coreutils binutils libnl3-dev libnl3-static python3
-
-            LLVM_BIN=\$(find /usr/lib/llvm*/bin -name llvm-objcopy 2>/dev/null | head -n 1)
-            if [ -n \"\$LLVM_BIN\" ]; then
-                export PATH=\"\$(dirname \$LLVM_BIN):\$PATH\"
-            fi
-
-            cd /workspace
-
-            # 1. 强制写入 .cargo/config.toml（最高优先级，Makefile 无法覆盖）
-            mkdir -p .cargo
-            cat << 'EOF' > .cargo/config.toml
-            [build]
-            rustflags = [\"-C\", \"target-feature=+crt-static\", \"-C\", \"link-arg=-static\"]
-
-            [target.aarch64-alpine-linux-musl]
-            rustflags = [\"-C\", \"target-feature=+crt-static\", \"-C\", \"link-arg=-static\"]
-
-            [target.aarch64-unknown-linux-musl]
-            rustflags = [\"-C\", \"target-feature=+crt-static\", \"-C\", \"link-arg=-static\"]
-            EOF
-
-            # 2. 导出所有静态编译环境变量
-            export RUSTFLAGS=\"-C target-feature=+crt-static -C link-arg=-static\"
-            export CARGO_TARGET_AARCH64_ALPINE_LINUX_MUSL_RUSTFLAGS=\"-C target-feature=+crt-static -C link-arg=-static\"
-            export PKG_CONFIG_ALL_STATIC=1
-            export LIBPCAP_STATIC=true
-
-            # 3. 执行 Retis 构建
-            CARGO_CMD_OPTS=\"--no-default-features\" make release
-
-            # 4. 找到编译出的二进制并复制到隔离目录
-            TARGET_BIN=\$(find target -name retis -type f -perm -111 | grep -v '\.d$' | head -n 1)
-            cp \"\$TARGET_BIN\" /output/retis
-            strip /output/retis
-
-            # 5. 兜底保障：若 ELF 仍残留 PT_INTERP，将其安全抹除为 PT_NULL
-            python3 -c '
-            import struct
-            with open(\"/output/retis\", \"r+b\") as f:
-                data = f.read()
-                e_phoff = struct.unpack_from(\"<Q\", data, 32)[0]
-                e_phentsize = struct.unpack_from(\"<H\", data, 54)[0]
-                e_phnum = struct.unpack_from(\"<H\", data, 56)[0]
-                cleaned = False
-                for i in range(e_phnum):
-                    offset = e_phoff + i * e_phentsize
-                    p_type = struct.unpack_from(\"<I\", data, offset)[0]
-                    if p_type == 3:  # PT_INTERP
-                        f.seek(offset)
-                        f.write(struct.pack(\"<I\", 0))  # 覆写为 PT_NULL
-                        cleaned = True
-                        print(\"[SUCCESS] 抹除了残余的 PT_INTERP 解释器路径！\")
-                        break
-                if not cleaned:
-                    print(\"[INFO] 二进制本身已是完全纯静态，无需修改 ELF 头。\")
-            '
-          "
+            alpine:edge /workspace/run_build.sh
 
       - name: 门禁检查二进制属性
         run: |
           ls -lh output/retis
           file output/retis
-          # 确保绝无动态解释器
-          readelf -l output/retis | grep -qv "program interpreter"
-          echo "静态检查通过！"
+
+          # 1. 必须是静态链接
+          file output/retis | grep "statically linked"
+
+          # 2. 绝对不能含有动态解释器字段
+          if readelf -l output/retis | grep -i "interpreter"; then
+              echo "错误: ELF 依然包含动态解释器！"
+              exit 1
+          fi
+
+          echo "恭喜！纯静态二进制验证通过，可在 Android 正常运行！"
 
       - name: 上传 Retis 单二进制
         uses: actions/upload-artifact@v4
         with:
-          name: retis
+          name: retis-android-arm64
           path: output/retis
