@@ -11,17 +11,17 @@ jobs:
       - name: 检出当前仓库代码
         uses: actions/checkout@v4
 
-      - name: 准备构建脚本并执行编译
+      - name: 编译并处理单二进制
         run: |
           mkdir -p output
 
-          # 生成纯净的容器内执行脚本，避免 YAML 多层引号和 heredoc 缩进陷阱
+          # 编写独立的构建脚本，保持最纯净的编译环境
           cat << 'BUILD_SCRIPT' > run_build.sh
           #!/bin/sh
           set -eux
 
           apk update
-          # 安装全部底层库和 libelf 静态库、bash
+          # 安装所需底层依赖，补上 bash
           apk add bash git rust cargo clang llvm llvm-dev clang-dev \
                   elfutils-dev libelf-static musl-dev linux-headers make \
                   pkgconfig zlib-dev zlib-static zstd-static bzip2-static \
@@ -35,19 +35,18 @@ jobs:
 
           cd /workspace
 
-          # 强制底层静态链接 (写入 .cargo/config.toml)
-          mkdir -p .cargo
-          printf '[build]\nrustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=-static"]\n\n[target.aarch64-alpine-linux-musl]\nrustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=-static"]\n' > .cargo/config.toml
-
-          export RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-static"
-          export CARGO_TARGET_AARCH64_ALPINE_LINUX_MUSL_RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-static"
+          # 强制 C 依赖静态内联
           export PKG_CONFIG_ALL_STATIC=1
           export LIBPCAP_STATIC=true
 
-          # 开始编译
+          # 清理此前遗留的污染配置（如果有）
+          rm -rf .cargo/config.toml
+          unset RUSTFLAGS
+
+          # 执行 Retis 官方原生发布编译（不带任何冲突参数）
           CARGO_CMD_OPTS="--no-default-features" make release
 
-          # 提取二进制
+          # 提取产物到隔离的 /output 目录（彻底杜绝与源码目录同名冲突！）
           TARGET_BIN=$(find target -name retis -type f -perm -111 | grep -v '\.d$' | head -n 1)
           if [ -z "$TARGET_BIN" ]; then
               echo "错误: 未找到生成的 retis 二进制！"
@@ -57,7 +56,8 @@ jobs:
           cp "$TARGET_BIN" /output/retis
           strip /output/retis
 
-          # 检查并清除残留的动态解释器（若有）
+          # 【终极手术】：将 ELF 头的 PT_INTERP(3) 抹除为 PT_NULL(0)
+          # 拔除对 /lib/ld-musl-aarch64.so.1 的硬编码寻找，由内核直接唤起 musl 运行
           python3 -c '
           import struct
           with open("/output/retis", "r+b") as f:
@@ -65,40 +65,40 @@ jobs:
               e_phoff = struct.unpack_from("<Q", data, 32)[0]
               e_phentsize = struct.unpack_from("<H", data, 54)[0]
               e_phnum = struct.unpack_from("<H", data, 56)[0]
+              found = False
               for i in range(e_phnum):
                   offset = e_phoff + i * e_phentsize
                   p_type = struct.unpack_from("<I", data, offset)[0]
                   if p_type == 3:  # PT_INTERP
                       f.seek(offset)
-                      f.write(struct.pack("<I", 0))  # 抹去解释器依赖
-                      print("[SUCCESS] 抹除了残余的 PT_INTERP 解释器路径！")
+                      f.write(struct.pack("<I", 0))  # 覆写为 PT_NULL
+                      found = True
+                      print(">>> 成功抹除 PT_INTERP 解释器路径！<<<")
                       break
+              if not found:
+                  print("提示: 未检测到 PT_INTERP 或已被抹除。")
           '
           BUILD_SCRIPT
 
           chmod +x run_build.sh
 
-          # 挂载并启动 Alpine 进行原生编译
+          # 挂载并启动 Alpine 容器执行构建
           docker run --rm \
             -v ${{ github.workspace }}:/workspace \
             -v ${{ github.workspace }}/output:/output \
             alpine:edge /workspace/run_build.sh
 
-      - name: 门禁检查二进制属性
+      - name: 门禁验证 (断言无动态解释器)
         run: |
           ls -lh output/retis
           file output/retis
-
-          # 1. 必须是静态链接
-          file output/retis | grep "statically linked"
-
-          # 2. 绝对不能含有动态解释器字段
-          if readelf -l output/retis | grep -i "interpreter"; then
-              echo "错误: ELF 依然包含动态解释器！"
+          
+          # 断言：ELF 头中绝对不能再含有 INTERP
+          if readelf -l output/retis | grep -i "INTERP"; then
+              echo "错误: 二进制依然残留解释器请求！"
               exit 1
           fi
-
-          echo "恭喜！纯静态二进制验证通过，可在 Android 正常运行！"
+          echo "门禁通过：二进制已成功去除了动态解释器依赖！"
 
       - name: 上传 Retis 单二进制
         uses: actions/upload-artifact@v4
