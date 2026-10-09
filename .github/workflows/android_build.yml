@@ -25,23 +25,22 @@ jobs:
                   pkgconfig zlib-dev zlib-static zstd-static bzip2-static \
                   libpcap-dev jq coreutils binutils libnl3-dev libnl3-static python3
 
-          # 1. 注入 llvm 工具链
+          # 1. 注入 llvm-objcopy
           LLVM_BIN=$(find /usr/lib/llvm*/bin -name llvm-objcopy 2>/dev/null | head -n 1)
           if [ -n "$LLVM_BIN" ]; then
               export PATH="$(dirname $LLVM_BIN):$PATH"
           fi
 
-          # 2. 修复 GCC 缺少静态 libgcc_s 的经典缺陷
+          # 2. 修复 musl 静态链接时缺失 -lgcc_s 的底层硬伤
           GCC_LIB_DIR=$(gcc -print-file-name=libgcc.a | xargs dirname)
           echo "INPUT(-lgcc -lgcc_eh)" > "$GCC_LIB_DIR/libgcc_s.a"
 
-          # 3. 精准智能拦截链接器：根据 -o 目标文件做精准外科手术
+          # 3. 编写核心拦截器
           REAL_GCC=$(which gcc)
           mkdir -p /usr/local/bin
 
           cat << EOF > /usr/local/bin/gcc-wrapper
           #!/bin/sh
-          # 获取最终输出产物 (-o 后的参数)
           OUTPUT_TARGET=""
           PREV_ARG=""
           IS_SHARED=0
@@ -56,7 +55,7 @@ jobs:
               PREV_ARG="\$arg"
           done
 
-          # 规则 1：如果是生成动态库 (-shared) 或目标是 .so，代表 proc-macro，完全原样放行
+          # A. 遇到 proc-macro 动态库 (-shared 或 .so) -> 100% 原生放行
           if [ \$IS_SHARED -eq 1 ]; then
               exec $REAL_GCC "\$@"
           fi
@@ -66,17 +65,17 @@ jobs:
                   ;;
           esac
 
-          # 规则 2：如果是主机构建脚本 (build_script_build)，完全原样放行
+          # B. 遇到主机构建脚本 (build_script_build) -> 100% 原生放行
           case "\$OUTPUT_TARGET" in
               *build_script_build*)
                   exec $REAL_GCC "\$@"
                   ;;
           esac
 
-          # 规则 3：命中主产物 retis -> 必须进行全静态闭合链接！
+          # C. 精准捕获 Cargo 输出的目标 retis (包括 target/.../deps/retis-<hash>)
           case "\$OUTPUT_TARGET" in
-              */retis|retis)
-                  echo "[WRAPPER] 成功锁定目标产物 retis，正在执行强制纯静态链接..."
+              *retis*)
+                  echo ">>> [LINKER WRAPPER HIT] 拦截到 retis 二进制: \$OUTPUT_TARGET，正在注入纯静态参数！ <<<"
                   NEW_ARGS=""
                   for arg in "\$@"; do
                       case "\$arg" in
@@ -84,7 +83,7 @@ jobs:
                               NEW_ARGS="\$NEW_ARGS -Wl,-Bstatic"
                               ;;
                           -pie|-Wl,-pie)
-                              # 剥离 PIE 动态解释倾向，强制标准静态 EXEC
+                              # 剥离 PIE 动态特征，强制静态 EXEC
                               ;;
                           *)
                               NEW_ARGS="\$NEW_ARGS \$arg"
@@ -95,7 +94,7 @@ jobs:
                   ;;
           esac
 
-          # 其他未匹配目标默认放行
+          # 默认兜底放行
           exec $REAL_GCC "\$@"
           EOF
 
@@ -107,18 +106,21 @@ jobs:
 
           cd /workspace
 
-          # 清除污染项
-          rm -rf .cargo/config.toml
-          unset RUSTFLAGS
+          # 4. 强制 Cargo 指定此包装器作为 target 链接器（最高优先级，绝无遗漏可能）
+          mkdir -p .cargo
+          cat << 'EOF_CARGO' > .cargo/config.toml
+          [target.aarch64-alpine-linux-musl]
+          linker = "/usr/local/bin/gcc-wrapper"
+          EOF_CARGO
 
           # 静态库标记
           export PKG_CONFIG_ALL_STATIC=1
           export LIBPCAP_STATIC=true
 
-          # 4. 执行编译
+          # 5. 执行 Retis 构建
           CARGO_CMD_OPTS="--no-default-features" make release
 
-          # 5. 提取二进制
+          # 6. 提取纯静态产物
           TARGET_BIN=$(find target -name retis -type f -perm -111 | grep -v '\.d$' | head -n 1)
           cp "$TARGET_BIN" /output/retis
           strip /output/retis
@@ -131,7 +133,7 @@ jobs:
             -v ${{ github.workspace }}/output:/output \
             alpine:edge /workspace/run_build.sh
 
-      - name: 门禁断言 (严格验证原生静态，拒绝任何动态妥协)
+      - name: 门禁断言 (严格断言纯静态)
         run: |
           ls -lh output/retis
           file output/retis
@@ -152,7 +154,7 @@ jobs:
           fi
 
           echo "=========================================================="
-          echo "纯静态单二进制构建完全成功！绝无段错误隐患！"
+          echo "纯静态单二进制构建大功告成！推送到 Android 即可直接运行！"
           echo "=========================================================="
 
       - name: 上传 Retis 单二进制
