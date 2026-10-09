@@ -15,13 +15,11 @@ jobs:
         run: |
           mkdir -p output
 
-          # 编写独立的构建脚本，保持最纯净的编译环境
           cat << 'BUILD_SCRIPT' > run_build.sh
           #!/bin/sh
           set -eux
 
           apk update
-          # 安装所需底层依赖，补上 bash
           apk add bash git rust cargo clang llvm llvm-dev clang-dev \
                   elfutils-dev libelf-static musl-dev linux-headers make \
                   pkgconfig zlib-dev zlib-static zstd-static bzip2-static \
@@ -35,29 +33,24 @@ jobs:
 
           cd /workspace
 
-          # 强制 C 依赖静态内联
+          # 强制 C 库静态内联
           export PKG_CONFIG_ALL_STATIC=1
           export LIBPCAP_STATIC=true
 
-          # 清理此前遗留的污染配置（如果有）
+          # 绝不注入全局 RUSTFLAGS，避免破坏 btf-rs-derive 过程宏
           rm -rf .cargo/config.toml
           unset RUSTFLAGS
 
-          # 执行 Retis 官方原生发布编译（不带任何冲突参数）
+          # 编译 Retis
           CARGO_CMD_OPTS="--no-default-features" make release
 
-          # 提取产物到隔离的 /output 目录（彻底杜绝与源码目录同名冲突！）
+          # 提取二进制到独立目录
           TARGET_BIN=$(find target -name retis -type f -perm -111 | grep -v '\.d$' | head -n 1)
-          if [ -z "$TARGET_BIN" ]; then
-              echo "错误: 未找到生成的 retis 二进制！"
-              exit 1
-          fi
-
           cp "$TARGET_BIN" /output/retis
           strip /output/retis
 
           # 【终极手术】：将 ELF 头的 PT_INTERP(3) 抹除为 PT_NULL(0)
-          # 拔除对 /lib/ld-musl-aarch64.so.1 的硬编码寻找，由内核直接唤起 musl 运行
+          # 拔除对 /lib/ld-musl-aarch64.so.1 的硬编码寻找
           python3 -c '
           import struct
           with open("/output/retis", "r+b") as f:
@@ -73,32 +66,40 @@ jobs:
                       f.seek(offset)
                       f.write(struct.pack("<I", 0))  # 覆写为 PT_NULL
                       found = True
-                      print(">>> 成功抹除 PT_INTERP 解释器路径！<<<")
+                      print(">>> [SUCCESS] 成功抹除 PT_INTERP 解释器路径！<<<")
                       break
               if not found:
-                  print("提示: 未检测到 PT_INTERP 或已被抹除。")
+                  print(">>> [INFO] 未检测到 PT_INTERP 或已抹除。<<<")
           '
           BUILD_SCRIPT
 
           chmod +x run_build.sh
 
-          # 挂载并启动 Alpine 容器执行构建
           docker run --rm \
             -v ${{ github.workspace }}:/workspace \
             -v ${{ github.workspace }}/output:/output \
             alpine:edge /workspace/run_build.sh
 
-      - name: 门禁验证 (断言无动态解释器)
+      - name: 门禁验证与属性核查
         run: |
           ls -lh output/retis
           file output/retis
-          
-          # 断言：ELF 头中绝对不能再含有 INTERP
-          if readelf -l output/retis | grep -i "INTERP"; then
-              echo "错误: 二进制依然残留解释器请求！"
+
+          # 1. 验证 file 输出中绝对不再包含 interpreter 解释器路径
+          if file output/retis | grep -qi "interpreter"; then
+              echo "错误: file 检查显示依然残留动态解释器！"
               exit 1
           fi
-          echo "门禁通过：二进制已成功去除了动态解释器依赖！"
+
+          # 2. 精准验证 Program Headers 表（只匹配大写的 INTERP 类型段，绝不误杀小写的 .interp 节名）
+          if readelf -l output/retis | awk '$1 == "INTERP"' | grep -q "INTERP"; then
+              echo "错误: Program Headers 中依然存在 PT_INTERP 解释器段！"
+              exit 1
+          fi
+
+          echo "=========================================="
+          echo "门禁检查 100% 通过！二进制无动态解释器请求！"
+          echo "=========================================="
 
       - name: 上传 Retis 单二进制
         uses: actions/upload-artifact@v4
