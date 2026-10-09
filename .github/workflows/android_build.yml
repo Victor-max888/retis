@@ -8,18 +8,19 @@ jobs:
     runs-on: ubuntu-24.04-arm
 
     steps:
-      - name: 编译 Retis 纯静态二进制 (Android 专用)
+      - name: 编译 Retis 纯静态单一二进制
         run: |
           cat << 'EOF' > run_build.sh
           #!/bin/sh
           set -eux
 
           apk update
-          # 安装完整编译链及静态库（补齐 zstd-static 保证 libelf 静态解析）
+          # 安装编译链及所有必要的静态依赖库
           apk add git rust cargo clang llvm llvm-dev clang-dev elfutils-dev \
                   musl-dev linux-headers make pkgconfig zlib-dev zlib-static \
-                  zstd-static libpcap-dev jq coreutils binutils
+                  zstd-static bzip2-static libpcap-dev jq coreutils binutils
 
+          # 自动修正 LLVM 工具链路径
           LLVM_BIN=$(find /usr/lib/llvm*/bin -name llvm-objcopy 2>/dev/null | head -n 1)
           if [ -n "$LLVM_BIN" ]; then
               export PATH="$(dirname $LLVM_BIN):$PATH"
@@ -30,7 +31,8 @@ jobs:
 
           TARGET=$(rustc -vV | sed -n 's|host: ||p')
 
-          # 【核心修复】：在 [build] 中显式绑定目标，激活 Target 静态参数
+          # 核心配置：同时传入 +crt-static、-static 和 -no-pie
+          # 彻底消除 Static-PIE 导致的动态解释器嵌入
           mkdir -p .cargo
           cat << CARGO_EOF > .cargo/config.toml
           [build]
@@ -39,14 +41,15 @@ jobs:
           [target.${TARGET}]
           rustflags = [
               "-C", "target-feature=+crt-static",
-              "-C", "link-arg=-static"
+              "-C", "link-arg=-static",
+              "-C", "link-arg=-no-pie"
           ]
           CARGO_EOF
 
-          # 执行编译（跳过 Python 插件）
+          # 编译 release 版本（跳过外部 python 依赖）
           CARGO_CMD_OPTS="--no-default-features" make release
 
-          # 定位目标产物并去除调试符号
+          # 自动提取产物并剔除多余调试符号
           BIN_PATH=$(find target/${TARGET}/release target/release -name retis -type f -perm -111 2>/dev/null | head -n 1)
           strip "$BIN_PATH"
           cp "$BIN_PATH" /output/retis
@@ -55,15 +58,15 @@ jobs:
           chmod +x run_build.sh
           docker run --rm -v ${{ github.workspace }}:/output alpine:edge /output/run_build.sh
 
-      - name: 验证二进制属性 (必须为 statically linked)
+      - name: 验证二进制属性 (严格检查 statically linked)
         run: |
           ls -lh retis
           file retis
-          # 门禁断言：无动态解释器
+          # 核心门禁：一旦出现 dynamically linked 或 interpreter 直接报错阻断
           file retis | grep -q "statically linked"
 
-      - name: 上传构建产物 (Artifact)
+      - name: 上传单一二进制文件 (Artifact)
         uses: actions/upload-artifact@v4
         with:
-          name: retis-android-arm64
+          name: retis
           path: retis
